@@ -90,6 +90,12 @@ pub struct Ready {
     // HardState will be equal to empty state if there is no update.
     pub hs: Option<HardState>,
 
+    // mvcc和raft协同问题。[mvcc问题4.1]
+    // sgonxu: read index 是log index，然而mvcc里面的ts又是啥呢
+    // tx-prewrite 先得到commited raft log index1，tx-commit的时候得到commited raft-log index2
+    // 读取时log-index3 如果 < log-index1,按下面说的applied index>log-index3,
+    // 读到的不就可能是连tx-prewrite都还没有apply的东西咯。
+    // 也就是linearability不能保证足够新：理想的应该是读取的数据如果有在apply中的话要等到apply完才算snap ready。
     // read_states states can be used for node to serve linearizable read requests locally
     // when its applied index is greater than the index in ReadState.
     // Note that the read_state will be returned when raft receives MsgReadIndex.
@@ -430,6 +436,12 @@ impl<T: Storage> RawNode<T> {
     // Read State has a read index. Once the application advances further than the read
     // index, any linearizable read requests issued before the read request can be
     // processed safely. The read state will have the same rctx attched.
+    // sgonxu: 只要apply过index，就可以处理read index了
+    // 但是一般read都是tx read，也就是readforwrite，往往需要全新的snapchat吧。
+    // 比如一个tx prewrite已经raft commited，这时候某个tx read读取其中某些key。
+    // 则如果给这个read的snap不足够新，就会有问题。
+    // 再比如两个tx prewrite都在写同一份数据，
+    // 是不是应该有个mvcc层，在共同内存上操作；不然各自改一份即使全新的copy，但先后提交就不对了。
     pub fn read_index(&mut self, rctx: Vec<u8>) {
         let mut m = Message::new();
         m.set_msg_type(MessageType::MsgReadIndex);

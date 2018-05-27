@@ -316,6 +316,7 @@ pub fn vote_resp_msg_type(t: MessageType) -> MessageType {
 }
 
 // Calculate the quorum of a Raft cluster with the specified total nodes.
+// sgonxu：法定投票数量，少于这么多则无效。
 pub fn quorum(total: usize) -> usize {
     total / 2 + 1
 }
@@ -803,6 +804,7 @@ impl<T: Storage> Raft<T> {
             "invalid transition [leader -> candidate]"
         );
         let term = self.term + 1;
+        // sgonxu：开始竞争前term++
         self.reset(term);
         let id = self.id;
         self.vote = id;
@@ -990,6 +992,24 @@ impl<T: Storage> Raft<T> {
                 && (m.get_msg_type() == MessageType::MsgHeartbeat
                     || m.get_msg_type() == MessageType::MsgAppend)
             {
+                //sgonxu： 一个follower在正式投票给一个peer之后，term也应该更新为voted term。下次follower竞选，又会term++
+                // 所以对一个分区后空跑的小区，term是会不断往上增长的。但他们的log term保持不变，因为没法产生leader往外或往local写log。
+                // 下次合区，真正leader1发日志过来，小区节点发现 "m.get_term() < self.term"， 会拉回term=m.get_term()。
+                // 如果follower投票后不更新term，只有收到新leader的log后更新term，那空跑小区term会停止增长。但是可能导致同一个term出现过多个leader。
+                // 比如一个leader1竞选成功了，term的log没发出去自己就被分区了，所有其他节点都没收到leader 1log，term还保持为vote前。这时又有新follower2用term去竞选再次成功/（另一种结果，都竞选都不成功：取决于能否vote要竞选term=自己当前term的人）。第一种结果就会导致 1同一个term出现了自己和新leader两个leader，log的同term同index性质无法再保证。 第二种结果导致raft死锁。
+                // 所以follower2在vote之后要更新term为voted term，再次竞选的时候，term++，就不会出现和前面的leader1相同term当选或者都无法当选。
+                // 但这样会有无法产生leader的空跑raft小区term一直增长的情况。
+
+                // 如果有pre-vote机制，小分区的pre-vote总是不成功，就不会导致voted term不断增长。
+                // pre-vote 阶段就已经确定了下一个整个集群唯一的pre leader a，进入vote阶段，b vote a，集群最新term=voted term。即只有未来的leader能发出voted term。
+                // 这种方式小分区进不到vote阶段，无法产生voted term并增长term。term就会停滞。就不会有m.get_term() < self.term然后拉回的问题？？从而保证leader term总是最大？
+
+                //如果preleader在prevote后vote之前挂掉了，没有节点有新voted term.. 这有点像leader挂了，preleader又挂了，少见。。
+
+                // https://www.jianshu.com/p/1496228df9a9
+                // Prevote是一个典型的2PC协议，第一阶段先征求其他节点是否同意选举，如果同意选举则发起真正的选举操作，否则降为Follower角色。这样就避免了网络分区节点重新加入集群，触发不必要的选举操作。
+                //【抽象】相当于让voter更新term=voted term之前，先试一下水。小分区永远试水不成功，term永远停滞。leader永远term最大。
+
                 // We have received messages from a leader at a lower term. It is possible
                 // that these messages were simply delayed in the network, but this could
                 // also mean that this node has advanced its term number during a network
@@ -1008,8 +1028,8 @@ impl<T: Storage> Raft<T> {
                 // When follower gets isolated, it soon starts an election ending
                 // up with a higher term than leader, although it won't receive enough
                 // votes to win the election. When it regains connectivity, this response
-                // with "pb.MsgAppResp" of higher term would force leader to step down.
-                // However, this disruption is inevitable to free this stuck node with
+                // with "pb.MsgAppResp" of higher term would force leader to step down.  // sgonxu: 小分区合区的时候，会用更大term来干扰leader。
+                // However, this disruption is inevitable to free this stuck node with   // 所以需要pre vote。
                 // fresh election. This can be prevented with Pre-Vote phase.
                 let to_send = new_message(m.get_from(), MessageType::MsgAppendResponse, None);
                 self.send(to_send);
@@ -1088,12 +1108,14 @@ impl<T: Storage> Raft<T> {
             },
             MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => {
                 // We can vote if this is a repeat of a vote we've already cast...
+                // sgonxu：可以重复投票，但是指定term只能投一个别人（self.vote)，这个别人是在ta prevote时确定的。
                 let can_vote = (self.vote == m.get_from()) ||
                     // ...we haven't voted and we don't think there's a leader yet in this term...
                     (self.vote == INVALID_ID && self.leader_id == INVALID_ID) ||
                     // ...or this is a PreVote for a future term...
                     (m.msg_type == MessageType::MsgRequestPreVote && m.get_term() > self.term);
                 // ...and we believe the candidate is up to date.
+                // sgonxu:is_update 表示被投票人log比自己新。
                 if can_vote && self.raft_log.is_up_to_date(m.get_index(), m.get_log_term()) {
                     // When responding to Msg{Pre,}Vote messages we include the term
                     // from the message, not the local term. To see why consider the
@@ -1108,6 +1130,7 @@ impl<T: Storage> Raft<T> {
                     let mut to_send =
                         new_message(m.get_from(), vote_resp_msg_type(m.get_msg_type()), None);
                     to_send.set_reject(false);
+                    // sgonxu：上面那段注释，为了不让被投票人diss掉
                     to_send.set_term(m.get_term());
                     self.send(to_send);
                     if m.get_msg_type() == MessageType::MsgRequestVote {
